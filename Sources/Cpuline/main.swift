@@ -627,210 +627,711 @@ final class SystemSampler: @unchecked Sendable {
     }
 }
 
-/// A series on the dashboard graph.
-struct MetricSeries {
-    let name: String
-    let color: NSColor
-    /// Timestamped values in percent (nil = unavailable), oldest first. The
-    /// graph positions points by time, so the line scrolls continuously.
-    var samples: [(time: TimeInterval, value: Double?)] = []
+/// The process list's columns, in display order.
+enum TopColumn: Int, CaseIterable, Sendable {
+    case category, pid, command, cpu, ipc, time, threads, ports, memory, compressed, ppid, state, idleWakeups
+    case switchRate, faultRate, pageinRate, limits, user
 
-    var latest: Double? { samples.last?.value }
-
-    mutating func add(_ value: Double?, at time: TimeInterval) {
-        samples.append((time, value))
+    /// The `top -stats` key; nil for columns worked out from other values.
+    var statKey: String? {
+        switch self {
+        case .pid: "pid"
+        case .command: "command"
+        case .cpu: "cpu"
+        case .time: "time"
+        case .threads: "th"
+        case .ports: "ports"
+        case .memory: "mem"
+        case .compressed: "cmprs"
+        case .ppid: "ppid"
+        case .state: "state"
+        case .idleWakeups: "idlew"
+        case .user: "user"
+        case .category, .ipc, .switchRate, .faultRate, .pageinRate, .limits: nil
+        }
     }
 
-    /// Drops samples older than `cutoff`, keeping one just before it so the
-    /// line slides in from the left edge instead of popping into view.
-    mutating func prune(before cutoff: TimeInterval) {
-        while samples.count > 1, samples[1].time < cutoff {
-            samples.removeFirst()
+    var title: String {
+        switch self {
+        case .category: "CATEGORY"
+        case .pid: "PID"
+        case .command: "COMMAND"
+        case .cpu: "%CPU"
+        case .ipc: "IPC"
+        case .time: "TIME"
+        case .threads: "#TH"
+        case .ports: "#PORTS"
+        case .memory: "MEM"
+        case .compressed: "CMPRS"
+        case .ppid: "PPID"
+        case .state: "STATE"
+        case .idleWakeups: "IDLEW"
+        case .switchRate: "CSW/S"
+        case .faultRate: "FLT/S"
+        case .pageinRate: "PIN/S"
+        case .limits: "LIMIT"
+        case .user: "USER"
+        }
+    }
+
+    /// These add up to fit the default window, so nothing starts off-screen,
+    /// with room in each header for the sort arrow.
+    var width: CGFloat {
+        switch self {
+        case .category: 100
+        case .pid, .ppid, .threads, .ipc: 55
+        case .command: 170
+        case .cpu, .compressed, .switchRate, .limits: 65
+        case .time, .idleWakeups: 75
+        case .ports: 70
+        case .memory, .state, .faultRate, .pageinRate: 60
+        case .user: 80
+        }
+    }
+
+    /// Header tooltip.
+    var help: String {
+        switch self {
+        case .category: "Apps, VMs, Services, CLI (command line tools), macOS or Other, worked out from where the program's file is. Click a triangle to collapse a category; its row shows the totals."
+        case .pid: "Process ID."
+        case .command: "The program's name."
+        case .cpu: "CPU use over the last sample, as in top: 100% is one full core, so it can go past 100%."
+        case .ipc: "Instructions per cycle over the last sample. Very low means the process is mostly stalled, often on memory. A rough signal."
+        case .time: "CPU time used since the process started: h:m:s, or m:s.hundredths when shorter."
+        case .threads: "Threads, with the number running after a slash when any are."
+        case .ports: "Mach ports the process holds. A count that keeps growing can mean a leak."
+        case .memory: "Memory use, as top reports it. Includes compressed memory."
+        case .compressed: "How much of the process's memory macOS has compressed to save space."
+        case .ppid: "The parent process's ID."
+        case .state: "Running, sleeping, stuck, and so on."
+        case .idleWakeups: "Times the process woke the CPU from idle. High counts cost battery."
+        case .switchRate: "Context switches per second. Blank for kernel_task, whose total has reached top's maximum."
+        case .faultRate: "Page faults per second: memory touched that wasn't mapped yet."
+        case .pageinRate: "Pages read in from disk per second. Sustained page-ins point to memory pressure."
+        case .limits: "macOS reported this program over its CPU or disk write limit in the last \(ResourceReports.recentDays) days. See Console, Diagnostic Reports."
+        case .user: "The account the process runs as."
+        }
+    }
+
+    var isText: Bool { [.category, .command, .state, .user].contains(self) }
+
+    /// The columns read straight from a row, in the order they arrive.
+    static let directColumns = allCases.filter { $0.statKey != nil && $0 != .command }
+    /// Inputs to the worked-out columns, which arrive after `directColumns`.
+    static let counterKeys = ["instrs", "cycles", "csw", "faults", "pageins"]
+    /// Field order for `-stats`. The command goes last because it can contain
+    /// spaces, so it's simply whatever remains of the line.
+    static let streamKeys = directColumns.compactMap(\.statKey) + counterKeys + ["command"]
+
+    /// A value's numeric meaning, for sorting; 0 for text or anything unreadable.
+    func sortValue(_ text: String) -> Double {
+        switch self {
+        case .category, .command, .state, .user: 0
+        // How many limits, so marked programs sort ahead of the blank majority.
+        case .limits: Double(text.split(separator: " ").count)
+        case .memory, .compressed: Self.bytes(text)
+        case .time: Self.seconds(text)
+        // `#TH` can read "722/10" (threads/running); the leading number counts.
+        default: Double(text.prefix { $0 != "/" }.replacingOccurrences(of: ",", with: ".")) ?? 0
+        }
+    }
+
+    /// A category's total for this column; nil where adding up means nothing.
+    func total(of rows: [TopProcess]) -> Double? {
+        switch self {
+        case .cpu, .threads, .ports, .memory, .compressed, .switchRate, .faultRate, .pageinRate:
+            rows.reduce(0) { $0 + $1.sortValues[rawValue] }
+        case .ipc: ListMetric.ipc.value(in: rows)
+        default: nil
+        }
+    }
+
+    /// `total` written like the column's own values.
+    func totalText(of rows: [TopProcess]) -> String {
+        guard let total = total(of: rows) else { return "" }
+        switch self {
+        case .cpu: return String(format: "%.1f", total)
+        case .ipc: return String(format: "%.2f", total)
+        case .memory, .compressed:
+            let gibibytes = total / 1_073_741_824
+            return gibibytes >= 1 ? String(format: "%.1fG", gibibytes) : "\(Int((total / 1_048_576).rounded()))M"
+        default: return String(Int(total))
+        }
+    }
+
+    private static func bytes(_ text: String) -> Double {
+        let multipliers: [Character: Double] = ["B": 1, "K": 1_024, "M": 1_048_576, "G": 1_073_741_824, "T": 1_099_511_627_776]
+        guard let unit = text.last, let multiplier = multipliers[unit],
+              let value = Double(text.dropLast().replacingOccurrences(of: ",", with: ".")) else { return 0 }
+        return value * multiplier
+    }
+
+    /// top prints "13:15:24" (h:m:s), but "42:24.75" (m:s.hundredths) when shorter.
+    private static func seconds(_ text: String) -> Double {
+        let parts = text.split(separator: ":").map { Double($0.replacingOccurrences(of: ",", with: ".")) ?? 0 }
+        return parts.reduce(0) { $0 * 60 + $1 }
+    }
+}
+
+/// A rough grouping by where a process's executable lives.
+enum ProcessCategory: Int, CaseIterable, Sendable {
+    case apps, virtualMachines, services, commandLine, macOS, other
+
+    var title: String {
+        switch self {
+        case .apps: "Apps"
+        case .virtualMachines: "VMs"
+        case .services: "Services"
+        case .commandLine: "CLI"
+        case .macOS: "macOS"
+        case .other: "Other"
+        }
+    }
+
+    init(path: String?, pid: Int) {
+        guard let path else {
+            // The kernel has no executable; others are gone or out of reach.
+            self = pid == 0 ? .macOS : .other
+            return
+        }
+        if path.contains("/Virtualization.framework/") {
+            self = .virtualMachines
+        } else if path.hasPrefix("/System/Applications/") {
+            self = .apps
+        } else if ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/Library/Apple/"].contains(where: path.hasPrefix) {
+            self = .macOS
+        } else if path.contains(".app/") {
+            self = .apps
+        } else if path.hasPrefix("/Library/") {
+            self = .services
+        } else {
+            self = .commandLine
         }
     }
 }
 
+/// How hard a process or category is working, from 0 to 1, and the neon
+/// colors that show it: green when light, through yellow, to red.
+enum Heat {
+    /// Full red is one whole core, or a quarter of the Mac's memory.
+    static func score(of process: TopProcess, physicalMemory: Double) -> Double {
+        score(cpu: process.sortValues[TopColumn.cpu.rawValue] / 100,
+              memory: process.sortValues[TopColumn.memory.rawValue] / (physicalMemory / 4))
+    }
+
+    /// A category against the whole Mac: every core busy, or all its memory.
+    /// On a process's scale, a big category like macOS would always be red.
+    static func score(of rows: [TopProcess], coreCount: Int, physicalMemory: Double) -> Double {
+        score(cpu: (TopColumn.cpu.total(of: rows) ?? 0) / (100 * Double(max(1, coreCount))),
+              memory: (TopColumn.memory.total(of: rows) ?? 0) / physicalMemory)
+    }
+
+    private static func score(cpu: Double, memory: Double) -> Double {
+        min(1, max(0, cpu, memory))
+    }
+
+    /// Neon green through yellow to red.
+    static func rgb(_ score: Double) -> (red: Double, green: Double, blue: Double) {
+        func mix(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
+        let green = (0.25, 1.0, 0.45), yellow = (1.0, 0.9, 0.2), red = (1.0, 0.25, 0.3)
+        let (from, to, t) = score < 0.5 ? (green, yellow, score / 0.5) : (yellow, red, (score - 0.5) / 0.5)
+        return (mix(from.0, to.0, t), mix(from.1, to.1, t), mix(from.2, to.2, t))
+    }
+
+    static func color(_ score: Double, alpha: Double = 1) -> NSColor {
+        let rgb = rgb(score)
+        return NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: alpha)
+    }
+
+    /// Light rows stay almost clear, so the tint picks out the busy ones.
+    static func background(_ score: Double) -> NSColor { color(score, alpha: 0.3 * score) }
+
+    /// Category rows are always tinted, so they read as headers.
+    static func groupBackground(_ score: Double) -> NSColor { color(score, alpha: 0.12 + 0.25 * score) }
+}
+
+struct TopProcess: Equatable, Sendable {
+    /// Indexed by `TopColumn.rawValue`.
+    var values: [String]
+    var sortValues: [Double]
+    var counters: Counters
+    var category = ProcessCategory.other
+
+    /// top's running totals, for working out rates between samples.
+    struct Counters: Equatable, Sendable {
+        var instructions: Double
+        var cycles: Double
+        var switches: Double
+        var faults: Double
+        var pageins: Double
+    }
+
+    var pid: Int { Int(sortValues[TopColumn.pid.rawValue]) }
+
+    subscript(column: TopColumn) -> String { values[column.rawValue] }
+
+    /// Reads one table row laid out in `TopColumn.streamKeys`. Nil if it's too short.
+    init?(line: String) {
+        let tokens = line.split(whereSeparator: \.isWhitespace)
+        let fixedCount = TopColumn.streamKeys.count - 1
+        guard tokens.count > fixedCount, Int(tokens[0]) != nil else { return nil }
+        // Between samples, top appends + or - to show a value's direction.
+        let fixed = tokens[..<fixedCount].map { $0.count > 1 && ($0.last == "+" || $0.last == "-") ? String($0.dropLast()) : String($0) }
+        var values = [String](repeating: "", count: TopColumn.allCases.count)
+        for (index, column) in TopColumn.directColumns.enumerated() {
+            values[column.rawValue] = fixed[index]
+        }
+        let numbers = fixed[TopColumn.directColumns.count...].map { Double($0) ?? 0 }
+        let (instructions, cycles) = (numbers[0], numbers[1])
+        if cycles > 0 { values[TopColumn.ipc.rawValue] = String(format: "%.2f", instructions / cycles) }
+        counters = Counters(instructions: instructions, cycles: cycles, switches: numbers[2], faults: numbers[3], pageins: numbers[4])
+        values[TopColumn.command.rawValue] = tokens[fixedCount...].joined(separator: " ")
+        self.values = values
+        sortValues = TopColumn.allCases.map { $0.sortValue(values[$0.rawValue]) }
+    }
+
+    mutating func set(_ column: TopColumn, _ text: String) {
+        values[column.rawValue] = text
+        sortValues[column.rawValue] = column.sortValue(text)
+    }
+
+    /// Blank when there's nothing to compare with, such as a new process.
+    mutating func setRates(since previous: Counters?, seconds: Double) {
+        func rate(_ now: Double, _ before: Double?) -> String {
+            // top's counters stop at Int32.max (kernel_task's switches already
+            // have), which would otherwise read as a rate of 0.
+            guard let before, seconds > 0, now >= before, now < Double(Int32.max) else { return "" }
+            return String(Int(((now - before) / seconds).rounded()))
+        }
+        set(.switchRate, rate(counters.switches, previous?.switches))
+        set(.faultRate, rate(counters.faults, previous?.faults))
+        set(.pageinRate, rate(counters.pageins, previous?.pageins))
+    }
+
+    mutating func setCategory(path: String?) {
+        category = ProcessCategory(path: path, pid: pid)
+        set(.category, category.title)
+    }
+
+    /// top cuts command names at 16 characters; `path` is the executable's, if
+    /// known. Only used when it really is the longer form of the same name.
+    mutating func restoreFullName(path: String?) {
+        let name = self[.command]
+        guard name.count >= 16, let path else { return }
+        let full = URL(fileURLWithPath: path).lastPathComponent
+        if full.hasPrefix(name) { values[TopColumn.command.rawValue] = full }
+    }
+}
+
+struct TopSample: Equatable, Sendable {
+    var summary: [String]
+    var processes: [TopProcess]
+}
+
+/// Splits top's endless logging output into samples. Used from one queue at a time.
+final class TopStreamParser: @unchecked Sendable {
+    private var partialLine = Data()
+    private var summary: [String] = []
+    private var rows: [TopProcess] = []
+    private var expectedRows: Int?
+    private var inTable = false
+    private var isFirstSample = true
+    private var previousCounters: [Int: TopProcess.Counters] = [:]
+    private var previousTime: Date?
+    private var now = Date()
+
+    /// Returns the samples completed by `data`. top's first sample has no
+    /// interval to measure over, so every %CPU in it is 0; it's dropped, but
+    /// its counters start the rates. `now` times them, as top's interval runs
+    /// about 5% over the one asked for.
+    func feed(_ data: Data, now: Date = Date()) -> [TopSample] {
+        self.now = now
+        partialLine.append(data)
+        var samples: [TopSample] = []
+        while let newline = partialLine.firstIndex(of: 0x0A) {
+            let line = String(decoding: partialLine[partialLine.startIndex..<newline], as: UTF8.self)
+            partialLine.removeSubrange(partialLine.startIndex...newline)
+            if let sample = consume(line) { samples.append(sample) }
+        }
+        return samples
+    }
+
+    private func consume(_ line: String) -> TopSample? {
+        if line.hasPrefix("Processes:") {
+            // Normally the table already closed on its row count; this catches a
+            // table whose rows didn't add up, one interval late.
+            let unfinished = inTable ? finishSample() : nil
+            summary = [line]
+            rows = []
+            inTable = false
+            expectedRows = line.split(separator: " ").dropFirst().first.flatMap { Int($0) }
+            return unfinished
+        }
+        guard inTable else {
+            if line.hasPrefix("PID ") {
+                inTable = true
+            } else {
+                summary.append(line)
+            }
+            return nil
+        }
+        if let row = TopProcess(line: line) { rows.append(row) }
+        return rows.count == expectedRows ? finishSample() : nil
+    }
+
+    private func finishSample() -> TopSample? {
+        inTable = false
+        defer { isFirstSample = false }
+        let seconds = previousTime.map { now.timeIntervalSince($0) } ?? 0
+        for index in rows.indices {
+            rows[index].setRates(since: previousCounters[rows[index].pid], seconds: seconds)
+        }
+        previousCounters = Dictionary(rows.map { ($0.pid, $0.counters) }, uniquingKeysWith: { _, last in last })
+        previousTime = now
+        return isFirstSample ? nil : TopSample(summary: summary, processes: rows)
+    }
+}
+
+/// The resource reports macOS keeps for Console: which programs recently went
+/// over a CPU or disk write limit.
+enum ResourceReports {
+    static let recentDays = 7
+    private static let directory = "/Library/Logs/DiagnosticReports"
+
+    struct Report: Equatable {
+        var command: String
+        var kind: String
+        var date: Date
+    }
+
+    /// Reads a report's header. Nil for other kinds of report in the folder.
+    static func parse(_ text: String) -> Report? {
+        var fields: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colon])
+            if fields[key] == nil {
+                fields[key] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        let kinds = ["cpu usage": "CPU", "disk writes": "Disk"]
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS Z"
+        guard let command = fields["Command"], let kind = fields["Event"].flatMap({ kinds[$0] }),
+              let date = fields["Date/Time"].flatMap(formatter.date(from:)) else { return nil }
+        return Report(command: command, kind: kind, date: date)
+    }
+
+    /// Program name to "CPU", "Disk" or "CPU Disk". Reports name a program, and
+    /// their PIDs are long gone, so every process of that name is marked.
+    static func marks(_ reports: [Report], now: Date) -> [String: String] {
+        let cutoff = now.addingTimeInterval(-Double(recentDays) * 86_400)
+        var kinds: [String: Set<String>] = [:]
+        for report in reports where report.date >= cutoff {
+            kinds[report.command, default: []].insert(report.kind)
+        }
+        return kinds.mapValues { $0.sorted().joined(separator: " ") }
+    }
+
+    /// Empty if the folder can't be read, which only loses the marks.
+    static func load() -> [String: String] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+        let reports = names.filter { $0.hasSuffix(".diag") }.compactMap { name -> Report? in
+            guard let file = FileHandle(forReadingAtPath: directory + "/" + name) else { return nil }
+            defer { try? file.close() }
+            // The fields needed are all in the header; reports run past 1 MB.
+            guard let data = try? file.read(upToCount: 4_096) else { return nil }
+            return parse(String(decoding: data, as: UTF8.self))
+        }
+        return marks(reports, now: Date())
+    }
+}
+
+/// A long-running `top` feeding the process list. It costs real CPU, so it only
+/// runs while the list is on screen. If the app dies, top gets SIGPIPE on its
+/// next write and exits, so it can't be orphaned.
+@MainActor
+final class TopStream {
+    private static let interval = 2
+    private var process: Process?
+
+    var isRunning: Bool { process != nil }
+
+    /// `onSample` and `onFailure` are called off the main thread.
+    func start(onSample: @escaping @Sendable (TopSample) -> Void, onFailure: @escaping @Sendable () -> Void) {
+        guard process == nil else { return }
+        let top = Process()
+        top.executableURL = URL(fileURLWithPath: "/usr/bin/top")
+        top.arguments = ["-l", "0", "-s", String(Self.interval),
+                         "-stats", TopColumn.streamKeys.joined(separator: ",")]
+        let output = Pipe()
+        top.standardOutput = output
+        top.standardError = FileHandle.nullDevice
+        let parser = TopStreamParser()
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            for var sample in parser.feed(data) {
+                for index in sample.processes.indices {
+                    let path = Self.executablePath(pid: sample.processes[index].pid)
+                    sample.processes[index].restoreFullName(path: path)
+                    sample.processes[index].setCategory(path: path)
+                }
+                onSample(sample)
+            }
+        }
+        top.terminationHandler = { _ in onFailure() }
+        do {
+            try top.run()
+            process = top
+        } catch {
+            output.fileHandleForReading.readabilityHandler = nil
+            onFailure()
+        }
+    }
+
+    func stop() {
+        guard let process else { return }
+        self.process = nil
+        // Cleared first: this exit is intentional, not a failure.
+        process.terminationHandler = nil
+        (process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        process.terminate()
+    }
+
+    private nonisolated static func executablePath(pid: Int) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        guard proc_pidpath(Int32(pid), &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
+    }
+}
+
+/// What the dashboard's graphs show: whole-system totals of the list's columns.
+enum ListMetric: CaseIterable {
+    case cpu, ipc, memory, switches, faults, pageins
+
+    var title: String {
+        switch self {
+        case .cpu: "%CPU"
+        case .ipc: "IPC"
+        case .memory: "MEM"
+        case .switches: "CSW/S"
+        case .faults: "FLT/S"
+        case .pageins: "PIN/S"
+        }
+    }
+
+    /// The graph's tooltip.
+    var help: String {
+        switch self {
+        case .cpu: "Total %CPU of every process. 100% is one full core, so the whole Mac tops out at \(ProcessInfo.processInfo.activeProcessorCount * 100)%."
+        case .ipc: "Instructions per cycle across all processes, so busy ones count for more. Lower means more time stalled, often on memory."
+        case .memory: "Total of the MEM column. It counts compressed memory, so it can go past the physical memory in use."
+        case .switches: "Context switches per second across all processes, without kernel_task."
+        case .faults: "Page faults per second across all processes."
+        case .pageins: "Pages read in from disk per second. Sustained page-ins point to memory pressure."
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .cpu: .systemGreen
+        case .ipc: .systemOrange
+        case .memory: .systemBlue
+        case .switches: .systemPink
+        case .faults: .systemPurple
+        case .pageins: .systemYellow
+        }
+    }
+
+    /// The lowest top of scale, so that background noise doesn't fill a graph.
+    var minimumCeiling: Double {
+        switch self {
+        case .cpu: 100
+        case .ipc: 1
+        case .memory: 1
+        case .switches, .faults: 1_000
+        case .pageins: 10
+        }
+    }
+
+    /// The total across `processes`: a sum, except IPC, which is total
+    /// instructions over total cycles so that busy processes count for more.
+    /// Memory is in GiB. Nil if nothing ran.
+    func value(in processes: [TopProcess]) -> Double? {
+        func sum(_ column: TopColumn) -> Double {
+            processes.reduce(0) { $0 + $1.sortValues[column.rawValue] }
+        }
+        switch self {
+        case .cpu: return sum(.cpu)
+        case .memory: return sum(.memory) / 1_073_741_824
+        case .switches: return sum(.switchRate)
+        case .faults: return sum(.faultRate)
+        case .pageins: return sum(.pageinRate)
+        case .ipc:
+            let cycles = processes.reduce(0) { $0 + $1.counters.cycles }
+            guard cycles > 0 else { return nil }
+            return processes.reduce(0) { $0 + $1.counters.instructions } / cycles
+        }
+    }
+
+    func format(_ value: Double) -> String {
+        switch self {
+        case .cpu: return "\(Int(value.rounded()))%"
+        case .ipc: return String(format: "%.2f", value)
+        case .memory: return value >= 100 ? "\(Int(value.rounded()))G" : String(format: "%.1fG", value)
+        case .switches, .faults, .pageins:
+            if value >= 999_500 { return String(format: "%.1fM", value / 1_000_000) }
+            if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+            return String(Int(value.rounded()))
+        }
+    }
+
+    /// A round top of scale (1, 2, 3 or 5 times a power of ten) above `peak`.
+    func ceiling(forPeak peak: Double) -> Double {
+        guard peak > minimumCeiling else { return minimumCeiling }
+        let magnitude = pow(10, floor(log10(peak)))
+        return [1, 2, 3, 5, 10].map { $0 * magnitude }.first { $0 >= peak } ?? peak
+    }
+}
+
+/// One small scrolling neon graph of a `ListMetric`, always scaled from zero.
 final class MetricGraphView: NSView {
-    var series: [MetricSeries] = []
-    /// Current time (system uptime); advanced every frame so lines scroll
-    /// continuously rather than stepping when a sample arrives.
+    let metric: ListMetric
+    /// Timestamped values, oldest first (nil = no data, which breaks the line).
+    /// Positioned by time, so the line scrolls continuously.
+    private var samples: [(time: TimeInterval, value: Double?)] = []
+    /// Current time (system uptime); advanced every frame so the line scrolls
+    /// rather than stepping when a sample arrives.
     var now: TimeInterval = ProcessInfo.processInfo.systemUptime
 
     /// Seconds of history visible across the graph's width.
     static let visibleWindow: TimeInterval = 60
     /// The right edge shows the state from this many seconds ago — more than
-    /// the sample interval — so the newest stretch of line is almost always
+    /// top's sample interval — so the newest stretch of line is almost always
     /// between two known samples and never reshapes.
-    static let displayDelay: TimeInterval = 2
+    static let displayDelay: TimeInterval = 3
 
     private let backgroundColor = Palette.canvas
     private let gridColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.07)
     private let axisTextColor = NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.45)
 
+    init(metric: ListMetric) {
+        self.metric = metric
+        super.init(frame: .zero)
+        toolTip = metric.help
+    }
+
+    required init?(coder: NSCoder) { fatalError("Not used from a nib") }
+
+    func add(_ value: Double?, at time: TimeInterval) {
+        samples.append((time, value))
+        // Keeps one sample past the left edge, so the line slides in rather than popping.
+        let cutoff = time - Self.displayDelay - Self.visibleWindow
+        while samples.count > 1, samples[1].time < cutoff {
+            samples.removeFirst()
+        }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
         let bounds = self.bounds
-
-        // Dark rounded canvas.
-        let canvas = NSBezierPath(roundedRect: bounds, xRadius: 14, yRadius: 14)
+        let canvas = NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10)
         backgroundColor.setFill()
         canvas.fill()
 
-        guard !series.isEmpty else { return }
-
-        let leftPad: CGFloat = 64
-        let topPad: CGFloat = 48
-        let bottomPad: CGFloat = 32
-        let labelGutter: CGFloat = 180
-        let rightPad: CGFloat = 16
-        let graphRect = NSRect(
-            x: leftPad,
-            y: bottomPad,
-            width: bounds.width - leftPad - labelGutter - rightPad,
-            height: bounds.height - topPad - bottomPad
-        )
+        let graphRect = NSRect(x: 42, y: 14, width: bounds.width - 42 - 14, height: bounds.height - 14 - 42)
         guard graphRect.width > 40, graphRect.height > 40 else { return }
 
-        drawTitle("CPU USAGE OVER TIME", at: CGPoint(x: leftPad, y: bounds.maxY - 32))
+        drawHeader(in: bounds)
 
-        let span = MetricGraphView.visibleWindow
-        let headTime = now - MetricGraphView.displayDelay
+        let ceiling = metric.ceiling(forPeak: samples.compactMap(\.value).max() ?? 0)
+        drawGrid(ctx, in: graphRect, ceiling: ceiling)
+
+        let span = Self.visibleWindow
+        let headTime = now - Self.displayDelay
 
         func point(_ time: TimeInterval, _ value: Double) -> CGPoint {
             let x = graphRect.maxX - CGFloat((headTime - time) / span) * graphRect.width
-            let y = graphRect.minY + CGFloat(value / 100) * graphRect.height
+            let y = graphRect.minY + CGFloat(value / ceiling) * graphRect.height
             return CGPoint(x: x, y: y)
         }
 
-        drawGrid(ctx, in: graphRect)
+        // Split into contiguous segments so missing readings break the line
+        // instead of plunging it to the floor.
+        var segments: [[CGPoint]] = []
+        var current: [CGPoint] = []
+        for sample in samples {
+            if let value = sample.value {
+                current.append(point(sample.time, value))
+            } else if !current.isEmpty {
+                segments.append(current)
+                current = []
+            }
+        }
+        // A late sample holds its last value flat up to the right edge.
+        if let last = samples.last, let value = last.value, last.time < headTime {
+            current.append(point(headTime, value))
+        }
+        if !current.isEmpty { segments.append(current) }
+        guard !segments.isEmpty else { return }
 
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-        var labels: [FloatingLabel] = []
-
-        // Lines extend past both edges of the plot (older samples on the left,
-        // samples newer than headTime on the right); clip them horizontally.
+        // The line extends past both edges of the plot (older samples on the left,
+        // samples newer than headTime on the right); clip it horizontally.
         ctx.saveGState()
         ctx.clip(to: NSRect(x: graphRect.minX, y: bounds.minY, width: graphRect.width, height: bounds.height))
-
-        for line in series {
-            // Split into contiguous segments so unavailable readings break the
-            // line instead of plunging it to the floor.
-            var segments: [[CGPoint]] = []
-            var current: [CGPoint] = []
-            for sample in line.samples {
-                if let value = sample.value {
-                    current.append(point(sample.time, value))
-                } else if !current.isEmpty {
-                    segments.append(current)
-                    current = []
-                }
-            }
-            // A late sample holds its last value flat up to the right edge.
-            if let last = line.samples.last, let value = last.value, last.time < headTime {
-                current.append(point(headTime, value))
-            }
-            if !current.isEmpty { segments.append(current) }
-            guard !segments.isEmpty else { continue }
-
-            for pts in segments {
-                drawAreaFill(ctx, points: pts, baseline: graphRect.minY,
-                             top: graphRect.maxY, color: line.color, colorSpace: colorSpace)
-                drawGlowLine(ctx, points: pts, color: line.color)
-            }
-
-            // The line's visible end: where it crosses the right edge.
-            guard let segment = segments.last(where: { $0[0].x <= graphRect.maxX }),
-                  let end = curvePoint(on: segment, atX: graphRect.maxX) ?? segment.last(where: { $0.x <= graphRect.maxX }),
-                  end.x >= graphRect.minX else { continue }
-            labels.append(FloatingLabel(text: labelText(for: line), color: line.color, anchor: end))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        for points in segments {
+            drawAreaFill(ctx, points: points, baseline: graphRect.minY,
+                         top: graphRect.maxY, color: metric.color, colorSpace: colorSpace)
+            drawGlowLine(ctx, points: points, color: metric.color)
         }
-
         ctx.restoreGState()
 
-        for label in labels {
-            drawEndDot(ctx, at: label.anchor, color: label.color)
-        }
-
-        drawFloatingLabels(ctx, labels, graphRect: graphRect)
-    }
-
-    private struct FloatingLabel {
-        let text: String
-        let color: NSColor
-        let anchor: CGPoint
-    }
-
-    private func labelText(for line: MetricSeries) -> String {
-        guard let value = line.latest else { return line.name }
-        return "\(line.name)  \(Int(value.rounded()))%"
-    }
-
-    /// Draws each series' label floating next to the end of its line. Labels
-    /// are nudged apart vertically so they stay readable when lines cluster,
-    /// with a faint connector back to the line's last point.
-    private func drawFloatingLabels(_ ctx: CGContext, _ labels: [FloatingLabel], graphRect: NSRect) {
-        guard !labels.isEmpty else { return }
-        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        let lineHeight = font.ascender - font.descender
-        let minGap = lineHeight + 4
-        let labelX = graphRect.maxX + 14
-
-        // Resolve vertical collisions from the top down.
-        let placed = labels.sorted { $0.anchor.y > $1.anchor.y }
-        var ys = placed.map { $0.anchor.y }
-        for i in 1..<ys.count where ys[i - 1] - ys[i] < minGap {
-            ys[i] = ys[i - 1] - minGap
-        }
-        // Keep the stack inside the canvas.
-        let overflow = graphRect.minY - (ys.last ?? graphRect.minY)
-        if overflow > 0 { for i in ys.indices { ys[i] += overflow } }
-
-        for (i, label) in placed.enumerated() {
-            let y = ys[i]
-
-            // Connector from the line's end point to the label.
-            ctx.saveGState()
-            ctx.setStrokeColor(label.color.withAlphaComponent(0.35).cgColor)
-            ctx.setLineWidth(1)
-            ctx.move(to: label.anchor)
-            ctx.addLine(to: CGPoint(x: labelX - 4, y: y))
-            ctx.strokePath()
-            ctx.restoreGState()
-
-            NSAttributedString(string: label.text, attributes: [
-                .font: font,
-                .foregroundColor: label.color
-            ]).draw(at: CGPoint(x: labelX, y: y - lineHeight / 2))
+        // The line's visible end: where it crosses the right edge.
+        if let segment = segments.last(where: { $0[0].x <= graphRect.maxX }),
+           let end = curvePoint(on: segment, atX: graphRect.maxX) ?? segment.last(where: { $0.x <= graphRect.maxX }),
+           end.x >= graphRect.minX {
+            drawEndDot(ctx, at: end, color: metric.color)
         }
     }
 
-    private func drawTitle(_ text: String, at origin: CGPoint) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+    /// The title, with the latest value at the other end in the line's color.
+    private func drawHeader(in bounds: NSRect) {
+        NSAttributedString(string: metric.title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             .foregroundColor: NSColor(calibratedRed: 1, green: 1, blue: 1, alpha: 0.75),
-            .kern: 2.0
-        ]
-        NSAttributedString(string: text, attributes: attrs)
-            .draw(at: origin)
+            .kern: 1.5
+        ]).draw(at: CGPoint(x: 14, y: bounds.maxY - 26))
+
+        let latest = samples.last?.value.map(metric.format) ?? "-"
+        let value = NSAttributedString(string: latest, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .semibold),
+            .foregroundColor: metric.color
+        ])
+        value.draw(at: CGPoint(x: bounds.maxX - value.size().width - 14, y: bounds.maxY - 30))
     }
 
-    private func drawGrid(_ ctx: CGContext, in rect: NSRect) {
+    private func drawGrid(_ ctx: CGContext, in rect: NSRect, ceiling: Double) {
         ctx.setLineWidth(1)
-        for i in 0...5 {
-            let y = rect.minY + CGFloat(i) * rect.height / 5
+        for i in 0...2 {
+            let y = rect.minY + CGFloat(i) * rect.height / 2
             ctx.setStrokeColor(gridColor.cgColor)
             ctx.move(to: CGPoint(x: rect.minX, y: y))
             ctx.addLine(to: CGPoint(x: rect.maxX, y: y))
             ctx.strokePath()
 
-            let label = NSAttributedString(string: "\(i * 20)%", attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+            let label = NSAttributedString(string: metric.format(ceiling * Double(i) / 2), attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
                 .foregroundColor: axisTextColor
             ])
             let size = label.size()
-            label.draw(at: CGPoint(x: rect.minX - size.width - 8, y: y - size.height / 2))
+            label.draw(at: CGPoint(x: rect.minX - size.width - 5, y: y - size.height / 2))
         }
     }
 
@@ -869,7 +1370,7 @@ final class MetricGraphView: NSView {
         // The glow is a few wide translucent strokes under the line rather than
         // a shadow blur: CG computes shadows with a CPU convolution every
         // frame, which made the blur most of the visible window's CPU cost.
-        for (width, alpha) in [(14.0, 0.06), (9.0, 0.10), (5.5, 0.22), (2.5, 1.0)] as [(CGFloat, CGFloat)] {
+        for (width, alpha) in [(9.0, 0.06), (6.0, 0.10), (3.5, 0.22), (1.75, 1.0)] as [(CGFloat, CGFloat)] {
             ctx.setStrokeColor(color.withAlphaComponent(alpha).cgColor)
             ctx.setLineWidth(width)
             ctx.addPath(line)
@@ -930,13 +1431,13 @@ final class MetricGraphView: NSView {
 
     private func drawEndDot(_ ctx: CGContext, at point: CGPoint, color: NSColor) {
         // Halo rings instead of a shadow blur, for the same reason as drawGlowLine.
-        for (r, alpha) in [(11.0, 0.08), (7.5, 0.18), (4.0, 1.0)] as [(CGFloat, CGFloat)] {
+        for (r, alpha) in [(8.0, 0.08), (5.5, 0.18), (3.0, 1.0)] as [(CGFloat, CGFloat)] {
             ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
             ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
         }
 
         ctx.setFillColor(NSColor.white.withAlphaComponent(0.9).cgColor)
-        ctx.fillEllipse(in: CGRect(x: point.x - 1.5, y: point.y - 1.5, width: 3, height: 3))
+        ctx.fillEllipse(in: CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2))
     }
 
 }
@@ -1180,16 +1681,255 @@ final class CPUPanelView: NSView {
     }
 }
 
+/// A category's row. Kept for the app's lifetime: the outline view remembers
+/// whether a row is collapsed by its object.
+final class ProcessGroupItem: NSObject {
+    let category: ProcessCategory
+    var rows: [ProcessRowItem] = []
+    var heat = 0.0
+
+    init(category: ProcessCategory) {
+        self.category = category
+    }
+}
+
+final class ProcessRowItem: NSObject {
+    let process: TopProcess
+    let heat: Double
+
+    init(process: TopProcess, heat: Double) {
+        self.process = process
+        self.heat = heat
+    }
+}
+
+/// Moves the first column's text clear of the disclosure triangles, which the
+/// outline view otherwise draws on top of it with no indentation.
+final class ProcessOutlineView: NSOutlineView {
+    override func frameOfCell(atColumn column: Int, row: Int) -> NSRect {
+        var frame = super.frameOfCell(atColumn: column, row: row)
+        if column == 0 {
+            frame.origin.x = 16
+            frame.size.width = tableColumns[0].width - 16
+        }
+        return frame
+    }
+}
+
+/// A row with a color over its background. The table overwrites a plain row
+/// view's `backgroundColor` when adding it, so this draws its own.
+final class TintedRowView: NSTableRowView {
+    var tint = NSColor.clear
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        tint.setFill()
+        dirtyRect.fill(using: .sourceOver)
+    }
+}
+
+/// The dashboard's process list: collapsible by category and sortable by any
+/// column, %CPU first like top. Rows and categories go from green to red as
+/// they use more CPU or memory.
+/// Keeps the selection and scroll position across refreshes.
+@MainActor
+final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    let table = ProcessOutlineView()
+    private var rows: [TopProcess] = []
+    private var groups: [ProcessGroupItem] = []
+    private let groupItems = ProcessCategory.allCases.map(ProcessGroupItem.init(category:))
+    private var seenCategories: Set<ProcessCategory> = []
+    private let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    private let groupFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+    private let physicalMemory = Double(ProcessInfo.processInfo.physicalMemory)
+    private let coreCount = ProcessInfo.processInfo.activeProcessorCount
+
+    override init() {
+        super.init()
+        for column in TopColumn.allCases {
+            let tableColumn = NSTableColumn(identifier: Self.identifier(column))
+            tableColumn.title = column.title
+            tableColumn.width = column.width
+            tableColumn.headerCell.alignment = column.isText ? .left : .right
+            tableColumn.headerToolTip = column.help
+            // Text reads best A to Z; numbers biggest first, on the first click.
+            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: String(column.rawValue), ascending: column.isText)
+            table.addTableColumn(tableColumn)
+        }
+        table.outlineTableColumn = table.tableColumns[TopColumn.category.rawValue]
+        table.indentationPerLevel = 0
+        table.dataSource = self
+        table.delegate = self
+        // The default spacing is wide enough to push the last columns off-screen.
+        table.style = .plain
+        table.intercellSpacing = NSSize(width: 4, height: 0)
+        table.rowHeight = 18
+        table.backgroundColor = Palette.canvas
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.sortDescriptors = [NSSortDescriptor(key: String(TopColumn.cpu.rawValue), ascending: false)]
+    }
+
+    private static func identifier(_ column: TopColumn) -> NSUserInterfaceItemIdentifier {
+        NSUserInterfaceItemIdentifier(String(column.rawValue))
+    }
+
+    func show(_ processes: [TopProcess]) {
+        rows = processes
+        reload()
+    }
+
+    private func reload() {
+        let selected = table.item(atRow: table.selectedRow)
+        let selectedPID = (selected as? ProcessRowItem)?.process.pid
+        // Reloading an outline view returns it to the top.
+        let scrollOrigin = table.enclosingScrollView?.contentView.bounds.origin
+
+        groups = Self.grouped(rows, by: table.sortDescriptors.first).map { category, members in
+            let group = groupItems[category.rawValue]
+            group.rows = members.map { ProcessRowItem(process: $0, heat: Heat.score(of: $0, physicalMemory: physicalMemory)) }
+            group.heat = Heat.score(of: members, coreCount: coreCount, physicalMemory: physicalMemory)
+            return group
+        }
+        table.reloadData()
+        // Categories start open. After that, a collapsed one stays collapsed.
+        for group in groups where seenCategories.insert(group.category).inserted {
+            table.expandItem(group)
+        }
+
+        let item: Any? = (selected as? ProcessGroupItem) ?? selectedPID.flatMap { pid in
+            groups.lazy.compactMap { $0.rows.first { $0.process.pid == pid } }.first
+        }
+        let row = item.map { table.row(forItem: $0) } ?? -1
+        if row >= 0 {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            table.deselectAll(nil)
+        }
+        if let scrollOrigin, let scrollView = table.enclosingScrollView {
+            scrollView.contentView.scroll(to: scrollOrigin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    /// Ties fall back to PID, so equal rows don't swap places on every refresh.
+    static func sorted(_ rows: [TopProcess], by descriptor: NSSortDescriptor?) -> [TopProcess] {
+        guard let descriptor, let raw = descriptor.key.flatMap(Int.init), let column = TopColumn(rawValue: raw) else { return rows }
+        return rows.sorted { a, b in
+            let order: ComparisonResult
+            if column.isText {
+                order = a[column].localizedCaseInsensitiveCompare(b[column])
+            } else {
+                let (x, y) = (a.sortValues[raw], b.sortValues[raw])
+                order = x < y ? .orderedAscending : (x > y ? .orderedDescending : .orderedSame)
+            }
+            if order == .orderedSame { return a.pid < b.pid }
+            return descriptor.ascending ? order == .orderedAscending : order == .orderedDescending
+        }
+    }
+
+    /// Non-empty categories with their sorted rows. Categories follow the same
+    /// sort by their totals, or stay in a fixed order for a column with no total.
+    static func grouped(_ rows: [TopProcess], by descriptor: NSSortDescriptor?) -> [(category: ProcessCategory, rows: [TopProcess])] {
+        let members = Dictionary(grouping: sorted(rows, by: descriptor), by: \.category)
+        let groups = ProcessCategory.allCases.compactMap { category in
+            members[category].map { (category: category, rows: $0) }
+        }
+        guard let descriptor, let column = descriptor.key.flatMap(Int.init).flatMap(TopColumn.init(rawValue:)) else { return groups }
+        if column == .category {
+            let byTitle = groups.sorted { $0.category.title.localizedCaseInsensitiveCompare($1.category.title) == .orderedAscending }
+            return descriptor.ascending ? byTitle : byTitle.reversed()
+        }
+        return groups.sorted { a, b in
+            guard let x = column.total(of: a.rows), let y = column.total(of: b.rows), x != y else {
+                return a.category.rawValue < b.category.rawValue
+            }
+            return descriptor.ascending ? x < y : x > y
+        }
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        guard let item else { return groups.count }
+        return (item as? ProcessGroupItem)?.rows.count ?? 0
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        guard let group = item as? ProcessGroupItem else { return groups[index] }
+        return group.rows[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        item is ProcessGroupItem
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        reload()
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        let row = TintedRowView()
+        if let group = item as? ProcessGroupItem {
+            row.tint = Heat.groupBackground(group.heat)
+        } else if let process = item as? ProcessRowItem {
+            row.tint = Heat.background(process.heat)
+        }
+        return row
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let identifier = tableColumn?.identifier, let raw = Int(identifier.rawValue),
+              let column = TopColumn(rawValue: raw) else { return nil }
+        // The table recycles cells, which matters at ~1000 rows reloaded every 2 s.
+        let label = outlineView.makeView(withIdentifier: identifier, owner: nil) as? NSTextField ?? {
+            let new = NSTextField(labelWithString: "")
+            new.identifier = identifier
+            new.alignment = column.isText ? .left : .right
+            new.lineBreakMode = .byTruncatingTail
+            return new
+        }()
+        if let group = item as? ProcessGroupItem {
+            let text = column == .category
+                ? "\(group.category.title) (\(group.rows.count))"
+                : column.totalText(of: group.rows.map(\.process))
+            label.attributedStringValue = neon(text, heat: group.heat, font: groupFont, column: column)
+        } else if let row = item as? ProcessRowItem {
+            label.attributedStringValue = neon(row.process[column], heat: row.heat, font: font, column: column)
+        }
+        return label
+    }
+
+    /// Text in its heat color with a soft glow, like the graphs' lines. Drawn
+    /// only when the list refreshes, so the shadow's blur costs little.
+    private func neon(_ text: String, heat: Double, font: NSFont, column: TopColumn) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = column.isText ? .left : .right
+        paragraph.lineBreakMode = .byTruncatingTail
+        let glow = NSShadow()
+        glow.shadowBlurRadius = 3
+        glow.shadowOffset = .zero
+        glow.shadowColor = Heat.color(heat, alpha: 0.7)
+        return NSAttributedString(string: text, attributes: [
+            .font: font,
+            .foregroundColor: Heat.color(heat),
+            .shadow: glow,
+            .paragraphStyle: paragraph
+        ])
+    }
+}
+
 @MainActor
 final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var window: NSWindow!
-    private var graphView: MetricGraphView!
+    private let graphViews = ListMetric.allCases.map { MetricGraphView(metric: $0) }
     private var footerLabel: NSTextField!
+    private let processTable = ProcessTableController()
+    private let topStream = TopStream()
+    private var processSummary: NSTextField!
+    private var limitMarks: [String: String] = [:]
+    private var initialFrame: NSRect?
     private let sampler = SystemSampler()
     private let sampleQueue = DispatchQueue(label: "sampler", qos: .utility)
     private var sampleTimer: Timer?
     private var isSampling = false
-    private var series: [MetricSeries] = []
     // Redraws the graph every frame so it scrolls continuously; samples are
     // only recorded once a second.
     private var frameTimer: Timer?
@@ -1238,7 +1978,6 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buildSeries()
         buildWindow()
         buildStatusItem()
         startSampling()
@@ -1249,35 +1988,20 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         // (see startFrameTimer/stopFrameTimerIfIdle).
     }
 
-    private func buildSeries() {
-        series = [
-            MetricSeries(name: "Total", color: .systemGreen),
-            MetricSeries(name: "User", color: .systemBlue),
-            MetricSeries(name: "System", color: .systemPink)
-        ]
-        // With a single group, its line would just repeat Total.
-        if sampler.groups.count > 1 {
-            let colors: [NSColor] = [.systemOrange, .systemPurple, .systemTeal]
-            for (index, group) in sampler.groups.enumerated() {
-                series.append(MetricSeries(name: group.name, color: colors[index % colors.count]))
-            }
-        }
-        series.append(MetricSeries(name: "GPU", color: .systemYellow))
-    }
-
     private func startFrameTimer() {
         guard frameTimer == nil else { return }
+        // These small graphs scroll under 4 pt/s, so more frames wouldn't show.
         // .common mode keeps frames coming during live resize; assumeIsolated
         // (not a Task per frame) avoids scheduling jitter.
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.renderFrame() }
         }
         RunLoop.main.add(timer, forMode: .common)
         frameTimer = timer
     }
 
-    /// Stops the 60 Hz timer when the graph isn't on screen, so the app doesn't
-    /// wake 60 times a second while it sits in the menu bar.
+    /// Stops the frame timer when the graphs aren't on screen, so the app doesn't
+    /// keep waking while it sits in the menu bar.
     private func stopFrameTimerIfIdle() {
         guard !(window.isVisible && window.occlusionState.contains(.visible)) else { return }
         frameTimer?.invalidate()
@@ -1289,9 +2013,57 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
     func windowDidChangeOcclusionState(_ notification: Notification) {
         if window.isVisible && window.occlusionState.contains(.visible) {
             startFrameTimer()
+            startProcessList()
         } else {
             stopFrameTimerIfIdle()
+            topStream.stop()
         }
+    }
+
+    private func startProcessList() {
+        guard !topStream.isRunning else { return }
+        processSummary.stringValue = "Reading processes…"
+        breakGraphLines()
+        Task {
+            limitMarks = await Task.detached { ResourceReports.load() }.value
+        }
+        topStream.start(onSample: { sample in
+            Task { @MainActor in self.show(sample) }
+        }, onFailure: {
+            Task { @MainActor in self.processListFailed() }
+        })
+    }
+
+    private func show(_ sample: TopSample) {
+        // A sample already on its way when the window closed changes nothing.
+        guard topStream.isRunning else { return }
+        var processes = sample.processes
+        for index in processes.indices {
+            processes[index].set(.limits, limitMarks[processes[index][.command]] ?? "")
+        }
+        processTable.show(processes)
+        let time = ProcessInfo.processInfo.systemUptime
+        for view in graphViews {
+            view.add(view.metric.value(in: processes), at: time)
+        }
+        processSummary.stringValue = sample.summary
+            .filter { $0.hasPrefix("Processes:") || $0.hasPrefix("PhysMem:") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "   ")
+    }
+
+    /// While nothing was measured, the lines show a gap rather than a straight
+    /// line that looks like data.
+    private func breakGraphLines() {
+        let time = ProcessInfo.processInfo.systemUptime
+        graphViews.forEach { $0.add(nil, at: time) }
+    }
+
+    /// top exited by itself. The next time the window appears tries again.
+    private func processListFailed() {
+        topStream.stop()
+        breakGraphLines()
+        processSummary.stringValue = "Couldn't read processes: /usr/bin/top stopped."
     }
 
     // Closing the window just hides it; the app keeps sampling in the menu bar.
@@ -1308,10 +2080,11 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 620),
+            // Wide enough for every column; a smaller screen scrolls sideways.
+            contentRect: NSRect(x: 0, y: 0, width: min(1405, NSScreen.main?.visibleFrame.width ?? 1405), height: 780),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
-            defer: true  // no backing store (or ~16 MB graph drawable) until first shown
+            defer: true  // no backing store or graph drawables until first shown
         )
         window.title = "Cpuline \(versionString)"
         window.isReleasedWhenClosed = false
@@ -1327,27 +2100,26 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         footerLabel = NSTextField(labelWithString: "Starting...")
         footerLabel.textColor = .secondaryLabelColor
 
-        graphView = MetricGraphView()
-        graphView.wantsLayer = true
-        graphView.series = series
-        graphView.translatesAutoresizingMaskIntoConstraints = false
+        let graphRow = NSStackView(views: graphViews)
+        graphRow.orientation = .horizontal
+        graphRow.distribution = .fillEqually
+        graphRow.spacing = 8
+        graphViews.forEach { $0.wantsLayer = true }
 
-        let scrollView = NSScrollView()
-        scrollView.documentView = graphView
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.borderType = .bezelBorder
+        processSummary = NSTextField(labelWithString: "")
+        processSummary.textColor = .secondaryLabelColor
 
-        // Pin the graph to fill the visible area so the dark canvas always
-        // covers the bezel and the chart scales to the window.
-        NSLayoutConstraint.activate([
-            graphView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            graphView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            graphView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            graphView.bottomAnchor.constraint(equalTo: scrollView.contentView.bottomAnchor)
-        ])
+        let tableScroll = NSScrollView()
+        tableScroll.documentView = processTable.table
+        tableScroll.hasVerticalScroller = true
+        tableScroll.hasHorizontalScroller = true
+        tableScroll.autohidesScrollers = true
+        tableScroll.borderType = .bezelBorder
+        tableScroll.appearance = NSAppearance(named: .darkAqua)
 
-        root.addArrangedSubview(scrollView)
+        root.addArrangedSubview(graphRow)
+        root.addArrangedSubview(processSummary)
+        root.addArrangedSubview(tableScroll)
         root.addArrangedSubview(footerLabel)
 
         window.contentView = root
@@ -1356,8 +2128,11 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
             root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
             root.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
-            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 420)
+            // The list is the window's main content; the graphs stay a strip.
+            graphRow.heightAnchor.constraint(equalToConstant: 170),
+            tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240)
         ])
+        initialFrame = window.frame
         // Not shown at launch: the app starts as a menu bar icon only, and the
         // window appears via the "Dashboard" button.
     }
@@ -1387,29 +2162,19 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         }
     }
 
-    /// Advances the graph's clock and redraws it — only while the window is
+    /// Advances the graphs' clock and redraws them — only while the window is
     /// actually on screen, so the menu-bar-only state stays near idle.
     private func renderFrame() {
         guard window.isVisible, window.occlusionState.contains(.visible) else { return }
-        graphView.now = ProcessInfo.processInfo.systemUptime
-        graphView.needsDisplay = true
+        let now = ProcessInfo.processInfo.systemUptime
+        for view in graphViews {
+            view.now = now
+            view.needsDisplay = true
+        }
     }
 
     private func apply(_ snapshot: Snapshot) {
         let cpu = snapshot.cpu
-        var values: [Double?] = [cpu.total * 100, cpu.user * 100, cpu.system * 100]
-        if sampler.groups.count > 1 {
-            values += sampler.groups.map { group -> Double? in
-                CoreUsage.average(snapshot.cores[group.cores.clamped(to: snapshot.cores.indices)]).total * 100
-            }
-        }
-        values.append(snapshot.gpuUtilization.map { $0 * 100 })
-        for index in series.indices {
-            series[index].add(values[index], at: snapshot.time)
-            series[index].prune(before: snapshot.time - MetricGraphView.displayDelay - MetricGraphView.visibleWindow)
-        }
-        graphView.series = series
-
         panel.snapshot = snapshot
         panel.history.append(cpu)
         if panel.history.count > CPUPanelView.historyLength { panel.history.removeFirst() }
@@ -1507,11 +2272,11 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         }
     }
 
-    // The window is kept for reuse, but its layer-backed graph would keep a
-    // ~16 MB drawable alive while hidden; drop it. The first visible frame
-    // after reopening redraws it.
+    // The window is kept for reuse, but its layer-backed graphs would keep
+    // their drawables alive while hidden; drop them. The first visible frame
+    // after reopening redraws them.
     func windowWillClose(_ notification: Notification) {
-        graphView.layer?.contents = nil
+        graphViews.forEach { $0.layer?.contents = nil }
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1525,8 +2290,16 @@ final class DashboardController: NSObject, NSApplicationDelegate, NSPopoverDeleg
         popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        // The first time it comes to the front, the window was seen to shrink
+        // to 1186 pt, whatever its size, cutting off columns. Only once, so
+        // the user's own resizing stays.
+        if let initialFrame {
+            window.setFrame(initialFrame, display: true)
+            self.initialFrame = nil
+        }
         // Also started by the occlusion callback; this guarantees it on first show.
         startFrameTimer()
+        startProcessList()
     }
 
     @objc private func quit() {

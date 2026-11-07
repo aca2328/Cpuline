@@ -11,7 +11,33 @@ Native macOS menu bar app that tracks CPU usage on your Mac, with GPU, load, and
   - **Processes**: the three busiest, as a percentage of all cores. Helpers count toward their app, and OS binaries are grouped as "macOS".
   - **GPU**: display refresh rate, then rings for usage, memory, temperature, and clock.
   - **Load and uptime**: the 1, 5, and 15 minute load averages, and time since boot.
-- **Dashboard window**: a smooth, continuously scrolling neon graph (60 s of history, 0–100%) of Total, User, System, each core type, and GPU, with floating labels. Closing the window keeps the app running in the menu bar.
+- **Dashboard window**: a detailed process list like the `top` command, under six small scrolling neon graphs (60 s of history) of the list's totals: %CPU, IPC, MEM, CSW/S, FLT/S, and PIN/S. Each has its own scale from zero, shown beside it, and fills only while the window is on screen, with a gap for any time it wasn't. MEM adds up the column, which counts compressed memory, so it can exceed the physical memory in use. CSW/S leaves out `kernel_task`, as in the list. The menu bar popover still shows User, System, each core type, and GPU. Closing the window keeps the app running in the menu bar.
+
+## Process list
+
+The list shows every process, refreshed about every 2 seconds, grouped by category and sorted by %CPU. Click a column header to sort by it, and click again to reverse. Click a category's triangle to collapse it; its row shows the category's totals.
+
+Every row is colored on one neon scale, from green through yellow to red. A process is full red at one full core of CPU or a quarter of the Mac's memory, whichever is closer, and its row is tinted more as it gets there. A category's row uses the same scale for its share of the whole Mac: all cores, or all of its memory. Hover over a column title or a graph for a description.
+
+| Column | Meaning |
+|---|---|
+| CATEGORY | Apps, VMs, Services, CLI (command line tools), macOS, or Other, worked out from where the executable is |
+| PID, PPID | Process ID and its parent's |
+| COMMAND | Executable name |
+| %CPU | As in `top`: 100% is one full core, so it can exceed 100% |
+| IPC | Instructions per cycle over the last sample. Very low usually means stalled, often on memory. Treat it as a rough signal: the same program can vary a lot between runs |
+| TIME | CPU time used: `h:m:s`, or `m:s.hundredths` when shorter |
+| #TH | Threads, with the number running after a slash when any are |
+| #PORTS | Mach ports |
+| MEM, CMPRS | Memory use and compressed memory, as `top` reports them |
+| STATE | Running, sleeping, stuck, and so on |
+| IDLEW | Times the process woke the CPU from idle |
+| CSW/S | Context switches per second. Blank for `kernel_task`, whose total has reached `top`'s maximum |
+| FLT/S, PIN/S | Page faults and page-ins per second. Sustained page-ins point to memory pressure |
+| LIMIT | `CPU` or `Disk` if macOS reported a program of this name over its CPU or disk write limit in the last 7 days, read when the list starts. The full reports are in Console, under Diagnostic Reports |
+| USER | Owner |
+
+There is deliberately no POWER column. In `top` it matched %CPU in every test here, although a background process at about 100% used about 50 times less energy than a normal one. The values come from `/usr/bin/top`, which runs only while the window is on screen and appears in the list itself. The popover's process percentages are a share of all cores, so a process at 90% here reads 9% there on a 10-core Mac.
 
 ## What the GPU values mean
 
