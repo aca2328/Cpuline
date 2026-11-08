@@ -692,7 +692,7 @@ enum TopColumn: Int, CaseIterable, Sendable {
     /// Header tooltip.
     var help: String {
         switch self {
-        case .category: "Apps, VMs, Services, CLI (command line tools), macOS or Other, worked out from where the program's file is. Click a triangle to collapse a category; its row shows the totals."
+        case .category: "Apps, VMs, Services, CLI (command line tools), macOS or Other, worked out from where the program's file is. Each category's row shows its totals; click its triangle to open or close it."
         case .pid: "Process ID."
         case .command: "The program's name."
         case .cpu: "CPU use over the last sample, as in top: 100% is one full core, so it can go past 100%."
@@ -1739,7 +1739,6 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
     private var rows: [TopProcess] = []
     private var groups: [ProcessGroupItem] = []
     private let groupItems = ProcessCategory.allCases.map(ProcessGroupItem.init(category:))
-    private var seenCategories: Set<ProcessCategory> = []
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
     private let groupFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
     private let physicalMemory = Double(ProcessInfo.processInfo.physicalMemory)
@@ -1792,10 +1791,7 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
             return group
         }
         table.reloadData()
-        // Categories start open. After that, a collapsed one stays collapsed.
-        for group in groups where seenCategories.insert(group.category).inserted {
-            table.expandItem(group)
-        }
+        // Categories start collapsed, and stay as the user leaves them.
 
         let item: Any? = (selected as? ProcessGroupItem) ?? selectedPID.flatMap { pid in
             groups.lazy.compactMap { $0.rows.first { $0.process.pid == pid } }.first

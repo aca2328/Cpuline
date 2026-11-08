@@ -15,7 +15,7 @@ Native macOS menu bar app that tracks CPU usage on your Mac, with GPU, load, and
 
 ## Process list
 
-The list shows every process, refreshed about every 2 seconds, grouped by category and sorted by %CPU. Click a column header to sort by it, and click again to reverse. Click a category's triangle to collapse it; its row shows the category's totals.
+The list shows every process, refreshed about every 2 seconds, grouped by category and sorted by %CPU. Categories start collapsed, showing their totals; click a triangle to open one. Click a column header to sort by it, and click again to reverse.
 
 Every row is colored on one neon scale, from dim green through bright yellow to red. A process is full red at one full core of CPU or a quarter of the Mac's memory, whichever is closer, and its row is tinted more as it gets there. A category's row uses the same scale for its share of the whole Mac: all cores, or all of its memory. Hover over a column title or a graph for a description.
 
