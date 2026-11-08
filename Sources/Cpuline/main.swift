@@ -830,10 +830,11 @@ enum Heat {
         min(1, max(0, cpu, memory))
     }
 
-    /// Neon green through yellow to red.
+    /// Dim green through bright yellow to red, so light rows recede and
+    /// brightness grows with load.
     static func rgb(_ score: Double) -> (red: Double, green: Double, blue: Double) {
         func mix(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
-        let green = (0.25, 1.0, 0.45), yellow = (1.0, 0.9, 0.2), red = (1.0, 0.25, 0.3)
+        let green = (0.2, 0.6, 0.32), yellow = (1.0, 0.9, 0.2), red = (1.0, 0.25, 0.3)
         let (from, to, t) = score < 0.5 ? (green, yellow, score / 0.5) : (yellow, red, (score - 0.5) / 0.5)
         return (mix(from.0, to.0, t), mix(from.1, to.1, t), mix(from.2, to.2, t))
     }
@@ -1906,7 +1907,8 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
         let glow = NSShadow()
         glow.shadowBlurRadius = 3
         glow.shadowOffset = .zero
-        glow.shadowColor = Heat.color(heat, alpha: 0.7)
+        // Light rows barely glow, so the busy ones stand out.
+        glow.shadowColor = Heat.color(heat, alpha: 0.2 + 0.5 * heat)
         return NSAttributedString(string: text, attributes: [
             .font: font,
             .foregroundColor: Heat.color(heat),

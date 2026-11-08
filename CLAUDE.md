@@ -6,7 +6,7 @@ Native macOS menu bar app (AppKit, Swift 6) tracking CPU usage per core, top pro
 - Run in dev: `swift run Cpuline`
 - Build release: `swift build --configuration release`
 - Build+run latest (pulls origin, clean rebuild): `./run.sh`
-- Package `.app` (universal, ad-hoc signed): `./bundle.sh`; publish a GitHub release `v1.0.<commit count>` with the zipped app: `./release.sh` (needs a clean tree pushed to `main`)
+- Package `.app` (universal, ad-hoc signed): `./bundle.sh`; publish a GitHub release `v1.0.<commit count>` with the zipped app: `./release.sh <changes.md>` (needs a clean tree pushed to `main`). The file lists the release's new features and changes, user-facing, and goes at the top of the notes; the script refuses to run without it
 - Run unit tests: `swift test` (Swift Testing, in `Tests/CpulineTests/`). Requires full Xcode installed (not just Command Line Tools) — without it, `swift test` can't locate the `Testing` framework.
 - Launch a build without touching real settings: `CFFIXED_USER_HOME=<tmp dir> .build/Cpuline.app/Contents/MacOS/Cpuline`
 - Measure memory with `footprint <pid>`, not RSS, which includes shared system memory and reads far higher.

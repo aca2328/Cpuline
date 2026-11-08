@@ -232,7 +232,7 @@ struct TopTests {
 
     @Test func colorGoesFromGreenThroughYellowToRed() {
         let (cool, warm, hot) = (Heat.rgb(0), Heat.rgb(0.5), Heat.rgb(1))
-        #expect(cool.green == 1 && cool.red < 0.5)
+        #expect(cool.green < 0.7 && cool.red < 0.5)
         #expect(warm.red == 1 && warm.green > 0.8)
         #expect(hot.red == 1 && hot.green < 0.3)
         #expect(Heat.rgb(0.25).red < Heat.rgb(0.75).red)

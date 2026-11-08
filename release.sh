@@ -4,7 +4,10 @@
 # This script:
 # 1. Checks the working tree is clean and main is pushed
 # 2. Builds the .app bundle with bundle.sh
-# 3. Zips it with LICENSE and creates release v1.0.<build number> with gh
+# 3. Zips it with LICENSE and creates release v1.0.<build number> with gh,
+#    with the changes from the file given as the first argument at the top
+#
+# Usage: ./release.sh <changes.md>  (a Markdown list of new features and changes)
 
 set -e
 
@@ -15,6 +18,12 @@ APP_NAME="Cpuline"
 BUILD_NUMBER="$(git rev-list --count HEAD)"
 TAG="v1.0.$BUILD_NUMBER"
 ZIP=".build/$APP_NAME.zip"
+CHANGES="$1"
+
+if [[ -z "$CHANGES" || ! -s "$CHANGES" ]]; then
+    echo "❌ Usage: ./release.sh <changes.md>, a list of the release's new features and changes."
+    exit 1
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "❌ Uncommitted changes, commit or stash them first."
@@ -39,15 +48,18 @@ cp -R ".build/$APP_NAME.app" LICENSE .build/release-zip/
 ditto -c -k .build/release-zip "$ZIP"
 
 echo "🚀 Creating release $TAG..."
-gh release create "$TAG" "$ZIP" --target "$(git rev-parse HEAD)" --title "$APP_NAME ${TAG#v}" --notes-file - <<'EOF'
+gh release create "$TAG" "$ZIP" --target "$(git rev-parse HEAD)" --title "$APP_NAME ${TAG#v}" --notes-file - <<EOF
+## What's new
+$(cat "$CHANGES")
+
 Menu bar app that tracks CPU usage per core, top processes, GPU, load, and uptime, with a live neon graph dashboard.
 
 ## Install
-1. Download `Cpuline.zip`, unzip it, and move `Cpuline.app` to Applications.
+1. Download \`Cpuline.zip\`, unzip it, and move \`Cpuline.app\` to Applications.
 2. The app is ad-hoc signed, not notarized, so macOS blocks it the first time. Open it once, then choose **Open Anyway** in System Settings › Privacy & Security. Or run:
-   ```sh
+   \`\`\`sh
    xattr -dr com.apple.quarantine /Applications/Cpuline.app
-   ```
+   \`\`\`
 
 Requires macOS 13 or later. Universal binary (Apple silicon and Intel).
 EOF
