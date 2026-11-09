@@ -1743,6 +1743,9 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
     private let groupFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
     private let physicalMemory = Double(ProcessInfo.processInfo.physicalMemory)
     private let coreCount = ProcessInfo.processInfo.activeProcessorCount
+    /// Titles of the categories the user left open, kept across launches.
+    private static let openCategoriesKey = "openCategories"
+    private var openCategories = Set(UserDefaults.standard.stringArray(forKey: openCategoriesKey) ?? [])
 
     override init() {
         super.init()
@@ -1791,7 +1794,12 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
             return group
         }
         table.reloadData()
-        // Categories start collapsed, and stay as the user leaves them.
+        // Categories start collapsed unless the user left them open, even in
+        // an earlier launch. A category that empties and comes back is
+        // collapsed by the table, so this reopens it too.
+        for group in groups where openCategories.contains(group.category.title) && !table.isItemExpanded(group) {
+            table.expandItem(group)
+        }
 
         let item: Any? = (selected as? ProcessGroupItem) ?? selectedPID.flatMap { pid in
             groups.lazy.compactMap { $0.rows.first { $0.process.pid == pid } }.first
@@ -1856,6 +1864,22 @@ final class ProcessTableController: NSObject, NSOutlineViewDataSource, NSOutline
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         item is ProcessGroupItem
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        rememberCategory(notification, isOpen: true)
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        rememberCategory(notification, isOpen: false)
+    }
+
+    private func rememberCategory(_ notification: Notification, isOpen: Bool) {
+        guard let group = notification.userInfo?["NSObject"] as? ProcessGroupItem else { return }
+        let title = group.category.title
+        guard openCategories.contains(title) != isOpen else { return }
+        if isOpen { openCategories.insert(title) } else { openCategories.remove(title) }
+        UserDefaults.standard.set(openCategories.sorted(), forKey: Self.openCategoriesKey)
     }
 
     func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
